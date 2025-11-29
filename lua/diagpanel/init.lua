@@ -11,10 +11,10 @@ local M = {}
 -- Default options (override via setup)
 local default_opts = {
     use_ascii = false,
-    width_fraction = 0.45,        -- max width fraction of editor
-    height_fraction = 0.25,       -- max height fraction of editor
-    max_lines_min = 3,            -- minimum panel rows when diags exist
-    max_msg_len = 80,             -- truncate message length
+    width_fraction = 0.45, -- max width fraction of editor
+    height_fraction = 0.25, -- max height fraction of editor
+    max_lines_min = 3,   -- minimum panel rows when diags exist
+    max_msg_len = 80,    -- truncate message length
     winblend = 45,
     border = "rounded",
     zindex = 300,
@@ -22,21 +22,22 @@ local default_opts = {
     ascii = { ERROR = "E", WARN = "W", INFO = "I", HINT = "H" },
     highlight = {
         error = { fg = "#ff6b6b", bg = "NONE", bold = true },
-        warn  = { fg = "#e0af68", bg = "NONE", italic = true },
-        info  = { fg = "#7aa2f7", bg = "NONE" },
-        hint  = { fg = "#9ece6a", bg = "NONE", italic = true },
+        warn = { fg = "#e0af68", bg = "NONE", italic = true },
+        info = { fg = "#7aa2f7", bg = "NONE" },
+        hint = { fg = "#9ece6a", bg = "NONE", italic = true },
         border = { fg = "#88c0d0", bg = "NONE", bold = true },
     },
     show_on_bufenter = true,
     show_on_diag_changed = true,
-    show_on_cursorhold = true,    -- will re-open if panel already exists
+    show_on_cursorhold = true, -- will re-open if panel already exists
     debounce_ms = 80,
     keymap = "<Leader>p",
-    buffer_keymaps = true,        -- maps <CR>, q, <Esc> inside the panel buffer
+    buffer_keymaps = true, -- maps <CR>, q, <Esc> inside the panel buffer
     float_opts = {
         border = "rounded",
         source = "always",
     },
+    live_typing = false,
 }
 
 -- Panel state
@@ -170,27 +171,48 @@ local function format_one(d)
     return string.format("%s %s line %d:%d -- %s", glyph, name, ln + 1, ch + 1, msg), ln, ch
 end
 
+-- Build panel lines for bufnr, dedupe identical line+col+message
 local function build_lines(bufnr)
     bufnr = bufnr or api.nvim_get_current_buf()
     local diags = diag.get(bufnr)
     if not diags or vim.tbl_isempty(diags) then
         return nil
     end
+
     local seen = {}
     local lines = {}
     local items = {}
+
+    -- convenience local of configured threshold (may be nil)
+    local thr = opts.severity_threshold
+
+    -- dynamic threshold: in insert mode + live_typing → hide INFO/HINT
+    local mode_ok, mode = pcall(api.nvim_get_mode)
+    local in_insert = mode_ok and mode and mode.mode == "i"
+
+    if in_insert and opts.live_typing then
+        -- HINT=4, INFO=3, WARN=2, ERROR=1
+        -- Setting threshold to WARN hides INFO & HINT during typing
+        thr = vim.diagnostic.severity.WARN
+    end
+
     for _, d in ipairs(diags) do
-        local key_ln = d.range and d.range.start and d.range.start.line or (d.lnum or 0)
-        local key_ch = d.range and d.range.start and d.range.start.character or (d.col or 0)
-        local key_msg = (d.message or ""):sub(1, 120)
-        local key = key_ln .. ":" .. key_ch .. ":" .. key_msg
-        if not seen[key] then
-            seen[key] = true
-            local s, ln, ch = format_one(d)
-            table.insert(lines, s)
-            table.insert(items, { diag = d, bufnr = bufnr, lnum = ln, col = ch })
+        -- if user set a threshold, only include diagnostics with severity <= threshold
+        -- (neovim: ERROR=1, WARN=2, INFO=3, HINT=4; smaller = more severe)
+        if not thr or (d.severity and d.severity <= thr) then
+            local key_ln = d.range and d.range.start and d.range.start.line or (d.lnum or 0)
+            local key_ch = d.range and d.range.start and d.range.start.character or (d.col or 0)
+            local key_msg = (d.message or ""):sub(1, 120)
+            local key = key_ln .. ":" .. key_ch .. ":" .. key_msg
+            if not seen[key] then
+                seen[key] = true
+                local s, ln, ch = format_one(d)
+                table.insert(lines, s)
+                table.insert(items, { diag = d, bufnr = bufnr, lnum = ln, col = ch })
+            end
         end
     end
+
     return lines, items
 end
 
@@ -430,7 +452,7 @@ function M.open()
     end
 end
 
--- reapply diagnostic signs (call after plugins loaded / VimEnter)
+-- reapply diagnostic signs (call after plugins loaded / on VimEnter)
 local function apply_diag_signs()
     local signs_text = {
         [diag.severity.ERROR] = opts.use_ascii and opts.ascii.ERROR or opts.glyphs.ERROR,
@@ -438,19 +460,42 @@ local function apply_diag_signs()
         [diag.severity.INFO] = opts.use_ascii and opts.ascii.INFO or opts.glyphs.INFO,
         [diag.severity.HINT] = opts.use_ascii and opts.ascii.HINT or opts.glyphs.HINT,
     }
+
     local signs_texthl = {
         [diag.severity.ERROR] = "DiagnosticSignError",
         [diag.severity.WARN] = "DiagnosticSignWarn",
         [diag.severity.INFO] = "DiagnosticSignInfo",
         [diag.severity.HINT] = "DiagnosticSignHint",
     }
-    local ok, existing = pcall(diag.config)
-    existing = (ok and existing) or {}
+
+    -- define the named signs explicitly using sign_define (more robust than only diag.config)
+    local function define_signs()
+        -- map severity constants to names we defined above
+        for sev, text in pairs(signs_text) do
+            local name = (sev == diag.severity.ERROR and "DiagnosticSignError")
+                or (sev == diag.severity.WARN and "DiagnosticSignWarn")
+                or (sev == diag.severity.INFO and "DiagnosticSignInfo")
+                or (sev == diag.severity.HINT and "DiagnosticSignHint")
+                or "DiagnosticSignInfo"
+            -- defensive: call sign_define in pcall to avoid errors on older neovim builds
+            pcall(vim.fn.sign_define, name, { text = text, texthl = signs_texthl[sev], numhl = "" })
+        end
+    end
+
+    -- also set diag.config signs mapping so virtual sign behavior follows the same glyphs
     pcall(function()
+        local ok, existing = pcall(diag.config)
+        existing = (ok and existing) or {}
         diag.config(vim.tbl_extend("force", existing, {
             signs = { text = signs_text, texthl = signs_texthl },
         }))
     end)
+
+    -- immediately (and deferred) apply sign definitions to beat colorscheme/plugin overrides
+    define_signs()
+    vim.defer_fn(define_signs, 50)
+    vim.defer_fn(define_signs, 200)
+    vim.defer_fn(define_signs, 700)
 end
 
 -- Apply highlight tweaks used in panel
@@ -497,6 +542,13 @@ function M.setup(user_opts)
         api.nvim_create_autocmd("DiagnosticChanged", {
             group = ag,
             callback = function(args)
+                -- If live_typing is false, ignore DiagnosticChanged events fired while in insert mode.
+                -- This prevents noisy updates while the user is typing.
+                local mode_ok, mode = pcall(api.nvim_get_mode)
+                local in_insert = mode_ok and mode and mode.mode == "i"
+                if in_insert and not opts.live_typing then
+                    return
+                end
                 open_panel(args.buf)
             end,
         })
@@ -526,7 +578,12 @@ function M.setup(user_opts)
 
     -- global keymap
     if opts.keymap and #opts.keymap > 0 then
-        api.nvim_set_keymap("n", opts.keymap, "<Cmd>lua require('diagpanel').open()<CR>", { noremap = true, silent = true })
+        api.nvim_set_keymap(
+            "n",
+            opts.keymap,
+            "<Cmd>lua require('diagpanel').open()<CR>",
+            { noremap = true, silent = true }
+        )
     end
 
     api.nvim_create_autocmd("VimLeavePre", {
@@ -536,6 +593,11 @@ function M.setup(user_opts)
             close_panel()
         end,
     })
+
+    -- expose current options for other plugins to query
+    function M._opts()
+        return opts
+    end
 end
 
 return M
